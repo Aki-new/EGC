@@ -13,6 +13,7 @@ import { z } from 'zod';
 import { createSearchIndex, rebuildSearchIndex, searchDecisions, createLessonsSearchIndex, rebuildLessonsSearchIndex, searchLessons } from './search.js';
 import { detectBranch, resolveStateRead, resolveStateWrite } from './branch-state';
 import { loadOrCreateKey, writeHmac, verifyHmac } from './integrity';
+import { loadOrCreateEncKey, readStateFile, writeStateFile } from './encryption';
 import { propagateStateToTools } from './propagate';
 import {
   createWorkingMemoryTable,
@@ -377,6 +378,7 @@ async function getDb(): Promise<Database> {
 
 const server = new Server({ name: "egc-memory-orchestrator", version: "3.0.0" }, { capabilities: { tools: {} } });
 const _integrityKey: Buffer = loadOrCreateKey();
+const _encKey: Buffer = loadOrCreateEncKey();
 
 function getStateDir(): string {
   const dir = path.join(os.homedir(), '.egc', 'state');
@@ -393,13 +395,14 @@ function resolveProjectPath(provided?: string): string {
   return path.resolve(raw);
 }
 
+const H2_RE = /^## (.+)/;
 function readStateDoc(filePath: string): Record<string, string[]|string> {
   if (!fs.existsSync(filePath)) return {};
-  const content = fs.readFileSync(filePath, 'utf-8');
+  const content = readStateFile(filePath, _encKey);
   const result: Record<string, string[]|string> = {};
   let currentSection = '';
   for (const line of content.split('\n')) {
-    const h2 = line.match(/^## (.+)/);
+    const h2 = H2_RE.exec(line);
     if (h2) { currentSection = h2[1].trim(); result[currentSection] = result[currentSection] || []; continue; }
     if (currentSection && line.trim() && !line.startsWith('#')) {
       const arr = result[currentSection];
@@ -461,8 +464,7 @@ function writeStateDoc(filePath: string, projectPath: string, data: {
     ``
   ];
 
-  fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
-  try { fs.chmodSync(filePath, 0o600); } catch { /* chmod not supported on Windows */ }
+  writeStateFile(filePath, lines.join('\n'), _encKey);
 }
 
 const LESSON_REINFORCE_DELTA = 0.15;
@@ -977,7 +979,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: `No state found for this project yet.\n${branchLine}Path: ${resolved.filePath}\n\nCall update_state at the end of this session to start building project memory.` }] };
         }
 
-        const content = fs.readFileSync(resolved.filePath, 'utf-8');
+        let content: string;
+        try {
+          content = readStateFile(resolved.filePath, _encKey);
+        } catch (err) {
+          log('ERROR', '[EGC encryption] Failed to decrypt state file', { file: resolved.filePath, error: String(err) });
+          return { content: [{ type: "text", text: `State file exists but could not be decrypted. The encryption key may have changed.\nPath: ${resolved.filePath}` }] };
+        }
         const verify = verifyHmac(resolved.filePath, content, _integrityKey);
         if (!verify.ok) {
           log('WARN', '[EGC integrity] State file integrity check failed', { file: resolved.filePath, reason: (verify as { ok: false; reason: string }).reason });
@@ -1013,12 +1021,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Merge from the same file get_state would read, so the first
         // branch-scoped write inherits the pre-existing flat state
         const resolved = resolveStateRead(getStateDir(), projPath, branch);
-        const existing = readStateDoc(resolved.filePath);
+        let existing: Record<string, string[]|string>;
+        try {
+          existing = readStateDoc(resolved.filePath);
+        } catch (err) {
+          log('ERROR', '[EGC encryption] Cannot read existing state — aborting update to prevent data loss', { file: resolved.filePath, error: String(err) });
+          throw new McpError(ErrorCode.InternalError, `Failed to decrypt existing state file. The encryption key may have changed. Path: ${resolved.filePath}`);
+        }
         const filePath = resolveStateWrite(getStateDir(), projPath, branch);
 
         fs.mkdirSync(path.dirname(filePath), { recursive: true });
         writeStateDoc(filePath, projPath, args, existing, branch);
-        const writtenContent = fs.readFileSync(filePath, 'utf-8');
+        const writtenContent = readStateFile(filePath, _encKey);
         writeHmac(filePath, writtenContent, _integrityKey);
         const propagated = propagateStateToTools({
           projectPath: projPath,
