@@ -1,4 +1,5 @@
 const assert = require('assert');
+const { randomInt } = require('node:crypto');
 async function getMockedDb() {
   const store = [];
   
@@ -34,7 +35,7 @@ class SQLiteArbitrationQueue {
   constructor() {
     this.queue = [];
     this.isProcessing = false;
-    this.MAX_RETRIES = 5;
+    this.MAX_RETRIES = 12;
     this.BASE_BACKOFF_MS = 10;
     this.MAX_BACKOFF_MS = 50;
   }
@@ -70,6 +71,9 @@ class SQLiteArbitrationQueue {
           task.retries++;
           let backoff = Math.pow(2, task.retries) * this.BASE_BACKOFF_MS;
           if (backoff > this.MAX_BACKOFF_MS) backoff = this.MAX_BACKOFF_MS;
+          // Equal jitter, mirrors the production queue in egc-memory/src/index.ts
+          const half = Math.floor(backoff / 2);
+          backoff = half + randomInt(0, half + 1);
 
           setTimeout(() => {
             this.queue.push(task); // Requeue at the end
